@@ -7,7 +7,6 @@ import re
 import sys
 import hashlib
 import urllib.request
-import time
 import subprocess
 
 gi.require_version('Gtk', '3.0')
@@ -17,11 +16,11 @@ from gi.repository import Gtk, GtkLayerShell, GLib, Pango, GdkPixbuf
 import cairo
 
 CHANNEL = "ceilciuz"
-MESSAGE_TIMEOUT = 15  # Temps en secondes avant la disparition du message
-AUDIO_FILE = "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga" # Chemin du pop audio
+MESSAGE_TIMEOUT = 15  # Temps en secondes avant la disparition individuelle du message
+AUDIO_FILE = "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga" 
 
 class EmoteManager:
-    """Gère le téléchargement synchrone (dans le thread IRC) et la mise en cache des emotes."""
+    """Gère le téléchargement synchrone et la mise en cache des emotes."""
     def __init__(self):
         self.cache = {}
         self.target_size = 24 
@@ -56,7 +55,6 @@ class TwitchOverlay(Gtk.Window):
     def __init__(self):
         super().__init__()
         self.emote_manager = EmoteManager()
-        self.message_queue = []
 
         # 1. Configuration Wayland Layer Shell
         GtkLayerShell.init_for_window(self)
@@ -83,34 +81,37 @@ class TwitchOverlay(Gtk.Window):
 
         self.set_size_request(350, -1)
         
-        # 3. Interface GTK
+        # 3. Architecture d'interface (Box vertical contenant de multiples TextView)
         self.scrolled_window = Gtk.ScrolledWindow()
         self.scrolled_window.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         
-        self.textview = Gtk.TextView()
-        self.textview.set_editable(False)
-        self.textview.set_cursor_visible(False)
-        self.textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.scrolled_window.add(self.vbox)
+        self.add(self.scrolled_window)
         
-       # CSS : Renforcement extrême de l'ombre pour lisibilité sur fond blanc
+        # CSS ciblant tous les noeuds créés par l'architecture VBox
         css_provider = Gtk.CssProvider()
         css = b"""
-        window, scrolledwindow, textview, textview text { 
+        window, scrolledwindow, viewport, box, textview { 
             background-color: transparent; 
             background-image: none;
         }
-        textview { 
+        textview text {
+            background-color: transparent;
             color: white; 
             font-family: sans-serif; 
             font-size: 15px; 
             font-weight: 900;
             text-shadow: 
-                0px 0px 4px rgba(0,0,0,1),
-                0px 0px 8px rgba(0,0,0,1),
-                2px 2px 2px rgba(0,0,0,1),
-                -2px -2px 2px rgba(0,0,0,1),
-                2px -2px 2px rgba(0,0,0,1),
-                -2px 2px 2px rgba(0,0,0,1);
+                2px 2px 0px black,
+                -2px -2px 0px black,
+                2px -2px 0px black,
+                -2px 2px 0px black,
+                0px 2px 0px black,
+                2px 0px 0px black,
+                0px -2px 0px black,
+                -2px 0px 0px black,
+                0px 0px 8px black;
         }
         """
         css_provider.load_from_data(css)
@@ -118,15 +119,9 @@ class TwitchOverlay(Gtk.Window):
             screen, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
 
-        self.textbuffer = self.textview.get_buffer()
-        self.scrolled_window.add(self.textview)
-        self.add(self.scrolled_window)
-
-        # 4. Lancement des workers
+        # 4. Lancement du thread IRC
         self.irc_thread = threading.Thread(target=self.twitch_irc_worker, daemon=True)
         self.irc_thread.start()
-
-        GLib.timeout_add_seconds(1, self.cleanup_old_messages)
 
     def get_user_color(self, username):
         if username == "SYSTEM": return "#ff0000"
@@ -140,20 +135,36 @@ class TwitchOverlay(Gtk.Window):
         return f"#{r:02x}{g:02x}{b:02x}"
 
     def play_notification_sound(self):
-        """Joue le son de manière asynchrone via PipeWire/PulseAudio"""
         try:
             subprocess.Popen(
-                ['pw-play', '--volume=5', AUDIO_FILE],
+                ['pw-play', '--volume=2.5', AUDIO_FILE],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
         except Exception:
-            pass # Silencieux si paplay échoue ou fichier manquant
+            pass
+
+    def remove_message_widget(self, widget):
+        """Détruit proprement un TextView spécifique sans affecter le reste du flux."""
+        if widget in self.vbox.get_children():
+            self.vbox.remove(widget)
+            widget.destroy()
+        return False # Interrompt ce timer spécifique
+
+    def _scroll_to_bottom(self):
+        """Rattrape le scroll lors de la modification de la VBox."""
+        adj = self.scrolled_window.get_vadjustment()
+        adj.set_value(adj.get_upper() - adj.get_page_size())
+        return False
 
     def append_message(self, user, message, emotes_raw=""):
-        # Initialisation du marqueur de début
-        start_iter = self.textbuffer.get_end_iter()
-        start_mark = self.textbuffer.create_mark(None, start_iter, left_gravity=True)
+        # Création d'un bloc de texte dédié pour ce message unique
+        msg_view = Gtk.TextView()
+        msg_view.set_editable(False)
+        msg_view.set_cursor_visible(False)
+        msg_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        
+        buf = msg_view.get_buffer()
 
         emotes_list = []
         if emotes_raw:
@@ -167,75 +178,49 @@ class TwitchOverlay(Gtk.Window):
         emotes_list.sort(key=lambda x: x[0])
 
         color = self.get_user_color(user)
-        tag_table = self.textbuffer.get_tag_table()
+        tag_table = buf.get_tag_table()
         tag = tag_table.lookup(user)
         if not tag:
-            tag = self.textbuffer.create_tag(user, foreground=color, weight=Pango.Weight.BOLD)
+            tag = buf.create_tag(user, foreground=color, weight=Pango.Weight.BOLD)
 
-        end_iter = self.textbuffer.get_end_iter()
-        self.textbuffer.insert_with_tags(end_iter, user, tag)
-        self.textbuffer.insert(self.textbuffer.get_end_iter(), ": ")
+        end_iter = buf.get_end_iter()
+        buf.insert_with_tags(end_iter, user, tag)
+        buf.insert(buf.get_end_iter(), ": ")
 
         current_idx = 0
         for start, end, e_id in emotes_list:
             if current_idx < start:
                 text_part = message[current_idx:start]
-                self.textbuffer.insert(self.textbuffer.get_end_iter(), text_part)
+                buf.insert(buf.get_end_iter(), text_part)
             
             pixbuf = self.emote_manager.get_emote_pixbuf(e_id)
             if pixbuf:
-                self.textbuffer.insert_pixbuf(self.textbuffer.get_end_iter(), pixbuf)
+                buf.insert_pixbuf(buf.get_end_iter(), pixbuf)
             else:
                 emote_name = message[start:end+1]
-                self.textbuffer.insert(self.textbuffer.get_end_iter(), emote_name)
+                buf.insert(buf.get_end_iter(), emote_name)
 
             current_idx = end + 1
 
         if current_idx < len(message):
-            self.textbuffer.insert(self.textbuffer.get_end_iter(), message[current_idx:])
-            
-        self.textbuffer.insert(self.textbuffer.get_end_iter(), "\n")
+            buf.insert(buf.get_end_iter(), message[current_idx:])
 
-        # Déclenchement du son uniquement si ce n'est pas le système
+        # Ajout du widget à l'interface
+        self.vbox.pack_start(msg_view, False, False, 0)
+        msg_view.show_all()
+
         if user != "SYSTEM":
             self.play_notification_sound()
 
-        # Initialisation du marqueur de fin et ajout à la file
-        end_iter = self.textbuffer.get_end_iter()
-        end_mark = self.textbuffer.create_mark(None, end_iter, left_gravity=False)
-        self.message_queue.append((time.time(), start_mark, end_mark))
+        # Nettoyage de mémoire : maintien d'une limite physique de 50 noeuds maximum
+        children = self.vbox.get_children()
+        if len(children) > 50:
+            self.vbox.remove(children[0])
+            children[0].destroy()
 
-        adj = self.scrolled_window.get_vadjustment()
-        adj.set_value(adj.get_upper() - adj.get_page_size())
-
-    def cleanup_old_messages(self):
-        current_time = time.time()
-        messages_to_remove = []
-
-        for item in self.message_queue:
-            timestamp, start_mark, end_mark = item
-            if current_time - timestamp > MESSAGE_TIMEOUT:
-                messages_to_remove.append(item)
-            else:
-                break 
-
-        if messages_to_remove:
-            self.textbuffer.begin_user_action()
-            for item in messages_to_remove:
-                timestamp, start_mark, end_mark = item
-                
-                start_iter = self.textbuffer.get_iter_at_mark(start_mark)
-                end_iter = self.textbuffer.get_iter_at_mark(end_mark)
-                
-                self.textbuffer.delete(start_iter, end_iter)
-                
-                self.textbuffer.delete_mark(start_mark)
-                self.textbuffer.delete_mark(end_mark)
-                
-                self.message_queue.remove(item)
-            self.textbuffer.end_user_action()
-
-        return True 
+        # Minuteur milliseconde strictement isolé sur l'instance de ce widget
+        GLib.timeout_add(MESSAGE_TIMEOUT * 1000, self.remove_message_widget, msg_view)
+        GLib.idle_add(self._scroll_to_bottom)
 
     def _safe_append(self, user, message, emotes_raw=""):
         GLib.idle_add(self.append_message, user, message, emotes_raw)
